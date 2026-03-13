@@ -14,22 +14,35 @@ const DSCO_API_TOKEN = scriptProperties.getProperty('DSCO_API_TOKEN');
 
 function syncNewOrders() {
   try {
-    const now = new Date();
-    const yesterday = new Date(now.getTime() - (24 * 60 * 60 * 1000)); 
+    const scriptProperties = PropertiesService.getScriptProperties();
     
-    const until = encodeURIComponent(now.toISOString());
-    const createdSince = encodeURIComponent(yesterday.toISOString());
+    // 1. Get the last time we checked (fallback to 2 hours ago if first run)
+    let lastPollTime = scriptProperties.getProperty('LAST_ORDER_POLL_TIME');
+    if (!lastPollTime) {
+      const twoHoursAgo = new Date(Date.now() - (2 * 60 * 60 * 1000));
+      lastPollTime = twoHoursAgo.toISOString();
+    }
 
-    const url = `https://api.dsco.io/api/v3/order/page?status=created&ordersCreatedSince=${createdSince}&until=${until}`; 
+    const now = new Date();
+    const until = encodeURIComponent(now.toISOString());
+    const createdSince = encodeURIComponent(lastPollTime);
+
+    // 2. THE WIDER NET: Ask for BOTH created and acknowledged orders!
+    const url = `https://api.dsco.io/api/v3/order/page?status=created&status=acknowledged&ordersCreatedSince=${createdSince}&until=${until}`; 
+    
+    // 🚨 Upgraded to use your new OAuth2 Token generator!
+    const dynamicToken = getDscoToken(); 
+
     const options = {
       'method': 'get',
       'headers': {
-        'authorization': 'Bearer ' + DSCO_API_TOKEN.trim(), 
+        'authorization': 'Bearer ' + dynamicToken, 
         'accept': 'application/json'
       },
       'muteHttpExceptions': true
     };
     
+    Logger.log(`Fetching orders created since: ${lastPollTime}`);
     const response = UrlFetchApp.fetch(url, options);
     
     if (response.getResponseCode() !== 200) {
@@ -42,6 +55,7 @@ function syncNewOrders() {
     
     if (orders.length === 0) {
       Logger.log('No new orders to sync right now.');
+      scriptProperties.setProperty('LAST_ORDER_POLL_TIME', now.toISOString()); // Move the clock forward
       return;
     }
 
@@ -52,13 +66,21 @@ function syncNewOrders() {
       const ssResponse = pushToShipStation(ssPayload);
       
       if (ssResponse && ssResponse.orderId) {
-        acknowledgeDscoOrder(dscoOrder.poNumber); 
-        Logger.log(`Success! Synced and acknowledged: ${dscoOrder.poNumber}`);
+         // 3. THE COURTESY CHECK: Only acknowledge it if SPS hasn't already done it
+         if (dscoOrder.status === 'created') {
+            acknowledgeDscoOrder(dscoOrder.poNumber); 
+            Logger.log(`✅ Success! Synced and acknowledged: ${dscoOrder.poNumber}`);
+         } else {
+            Logger.log(`✅ Success! Synced (SPS already acknowledged): ${dscoOrder.poNumber}`);
+         }
       }
     });
 
+    // 4. Save the exact time we finished, so the next 30-minute run starts exactly here
+    scriptProperties.setProperty('LAST_ORDER_POLL_TIME', now.toISOString());
+
   } catch (error) {
-    Logger.log('Error in syncNewOrders: ' + error.message);
+    Logger.log('⚠️ Error in syncNewOrders: ' + error.message);
   }
 }
 
