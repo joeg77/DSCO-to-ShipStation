@@ -26,7 +26,7 @@ function syncNewOrders() {
     const createdSince = encodeURIComponent(lastPollTime);
 
     // 2. Ask for BOTH created and acknowledged orders
-    const url = `https://api.dsco.io/api/v3/order/page?status=created&status=acknowledged&ordersCreatedSince=${createdSince}&until=${until}`; 
+    const url = `https://api.dsco.io/api/v3/order/page?ordersCreatedSince=${createdSince}&until=${until}`;
     
     const dynamicToken = getDscoToken(); 
 
@@ -57,18 +57,22 @@ function syncNewOrders() {
     }
 
     orders.forEach(dscoOrder => {
-      Logger.log('Processing Order: ' + dscoOrder.poNumber);
+      // 🚨 Skip orders that are already fully shipped or cancelled
+      if (dscoOrder.status === 'shipped' || dscoOrder.status === 'cancelled') {
+        return; 
+      }
+
+      Logger.log('Processing Order: ' + dscoOrder.poNumber + ' | Status: ' + dscoOrder.status);
       
       const ssPayload = mapOrderToShipStation(dscoOrder);
       const ssResponse = pushToShipStation(ssPayload);
       
       if (ssResponse && ssResponse.orderId) {
-         // 3. Only acknowledge it if SPS hasn't already done it
          if (dscoOrder.status === 'created') {
             acknowledgeDscoOrder(dscoOrder.poNumber); 
             Logger.log(`✅ Success! Synced and acknowledged: ${dscoOrder.poNumber}`);
          } else {
-            Logger.log(`✅ Success! Synced (SPS already acknowledged): ${dscoOrder.poNumber}`);
+            Logger.log(`✅ Success! Synced (Already acknowledged by SPS): ${dscoOrder.poNumber}`);
          }
       }
     });
