@@ -240,7 +240,8 @@ function sendTrackingToDsco(orderNum, tracking, carrier, shipDate, orderId) {
   };
   
   let dscoLineItems = [];
-  let shipMethod = "Ground"; 
+  // Set the default safety net to FedEx Home Delivery
+  let shipMethod = "FedEx Home Delivery"; 
   
   const ssResponse = UrlFetchApp.fetch(ssUrl, ssOptions);
   
@@ -252,6 +253,7 @@ function sendTrackingToDsco(orderNum, tracking, carrier, shipDate, orderId) {
 
     const ssItems = orderData.items || [];
     
+    // Map the line items exactly as Chewy needs them
     dscoLineItems = ssItems.map((item, index) => ({
        "lineNumber": index + 1, 
        "sku": item.sku,
@@ -266,15 +268,16 @@ function sendTrackingToDsco(orderNum, tracking, carrier, shipDate, orderId) {
   const dynamicToken = getDscoToken();
   const url = `https://api.dsco.io/api/v3/order/singleShipment`;
   
+  // 🚨 THE ABSOLUTE FINAL PAYLOAD
   const payload = {
     "poNumber": realOrderNum,
     "shipments": [
       {
         "trackingNumber": tracking,
-        "shipCarrier": carrier, 
+        "shipCarrier": "FedEx", // Hardcoded since you exclusively use FedEx
         "shipMethod": shipMethod, 
-        "shippingServiceLevelCode": "UG", 
-        "warehouseCode": "REPLACE_ME", // 🚨 REMINDER: Update this to your Chewy warehouse ID!
+        "shippingServiceLevelCode": "HD", // HD = FedEx Home Delivery
+        "warehouseCode": "CROWDER", // Your exact Chewy Warehouse ID
         "shipDate": shipDate || new Date().toISOString(),
         "lineItems": dscoLineItems 
       }
@@ -302,6 +305,9 @@ function sendTrackingToDsco(orderNum, tracking, carrier, shipDate, orderId) {
      Logger.log(`⚠️ DSCO Push Failed for ${realOrderNum} | Code: ${responseCode} | Response: ${responseBody}`);
   }
 }
+
+
+
 
 // ==============================================================================
 // OAUTH2 TOKEN MANAGER
