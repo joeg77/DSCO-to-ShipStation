@@ -1,0 +1,785 @@
+// ==============================================================================
+// DSCO to ShipStation Order Sync & Tracking Push
+// ==============================================================================
+
+// --- INITIALIZE PROPERTIES (GLOBAL VARIABLES) ---
+const scriptProperties = PropertiesService.getScriptProperties();
+const SS_API_KEY = scriptProperties.getProperty('SS_API_KEY');
+const SS_API_SECRET = scriptProperties.getProperty('SS_API_SECRET');
+const DSCO_API_TOKEN = scriptProperties.getProperty('DSCO_API_TOKEN'); 
+
+// ==============================================================================
+// PART 1: PULL ORDERS FROM DSCO -> PUSH TO SHIPSTATION
+// ==============================================================================
+
+function syncNewOrders() {
+  try {
+    const now = new Date();
+    const yesterday = new Date(now.getTime() - (24 * 60 * 60 * 1000)); 
+    
+    const until = encodeURIComponent(now.toISOString());
+    const createdSince = encodeURIComponent(yesterday.toISOString());
+
+    const url = `https://api.dsco.io/api/v3/order/page?status=created&ordersCreatedSince=${createdSince}&until=${until}`; 
+    const options = {
+      'method': 'get',
+      'headers': {
+        'authorization': 'Bearer ' + DSCO_API_TOKEN.trim(), 
+        'accept': 'application/json'
+      },
+      'muteHttpExceptions': true
+    };
+    
+    const response = UrlFetchApp.fetch(url, options);
+    
+    if (response.getResponseCode() !== 200) {
+      Logger.log('Failed to fetch from DSCO: ' + response.getContentText());
+      return;
+    }
+    
+    const dscoData = JSON.parse(response.getContentText());
+    const orders = dscoData.orders || [];
+    
+    if (orders.length === 0) {
+      Logger.log('No new orders to sync right now.');
+      return;
+    }
+
+    orders.forEach(dscoOrder => {
+      Logger.log('Processing Order: ' + dscoOrder.poNumber);
+      
+      const ssPayload = mapOrderToShipStation(dscoOrder);
+      const ssResponse = pushToShipStation(ssPayload);
+      
+      if (ssResponse && ssResponse.orderId) {
+        acknowledgeDscoOrder(dscoOrder.poNumber); 
+        Logger.log(`Success! Synced and acknowledged: ${dscoOrder.poNumber}`);
+      }
+    });
+
+  } catch (error) {
+    Logger.log('Error in syncNewOrders: ' + error.message);
+  }
+}
+
+// --- ORDER SYNC HELPER FUNCTIONS ---
+
+function mapOrderToShipStation(dscoOrder) {
+  const addressInfo = {
+    "name": dscoOrder.shipping.name || (dscoOrder.shipping.firstName + " " + dscoOrder.shipping.lastName),
+    "street1": dscoOrder.shipping.address1,
+    "city": dscoOrder.shipping.city,
+    "state": dscoOrder.shipping.state || dscoOrder.shipping.region,
+    "postalCode": dscoOrder.shipping.postal,
+    "country": dscoOrder.shipping.country || "US",
+    "phone": dscoOrder.shipping.phone || ""
+  };
+
+  return {
+    "orderNumber": dscoOrder.poNumber,
+    "orderDate": dscoOrder.retailerCreateDate,
+    "orderStatus": "awaiting_shipment",
+    "customerEmail": dscoOrder.shipping.email,
+    "customerNotes": dscoOrder.shipInstructions || "",
+    "requestedShippingService": (dscoOrder.requestedShipCarrier + " " + dscoOrder.requestedShipMethod).trim(),
+    "billTo": addressInfo,
+    "shipTo": addressInfo,
+    "advancedOptions": {
+      "storeId": 829584 
+    },
+    "items": dscoOrder.lineItems.map(item => ({
+      "sku": item.sku,
+      "name": item.productGroup || item.sku,
+      "quantity": item.quantity,
+      "unitPrice": item.expectedCost || 0.00
+    }))
+  };
+}
+
+function pushToShipStation(payload) {
+  const url = 'https://ssapi.shipstation.com/orders/createorder';
+  const encodedAuth = Utilities.base64Encode(SS_API_KEY + ':' + SS_API_SECRET);
+  
+  const options = {
+    'method': 'post',
+    'headers': {
+      'Authorization': 'Basic ' + encodedAuth,
+      'Content-Type': 'application/json'
+    },
+    'payload': JSON.stringify(payload),
+    'muteHttpExceptions': true
+  };
+  
+  const response = UrlFetchApp.fetch(url, options);
+  
+  if (response.getResponseCode() !== 200) {
+    throw new Error('ShipStation Error: ' + response.getContentText());
+  }
+  
+  return JSON.parse(response.getContentText());
+}
+
+function acknowledgeDscoOrder(poNumber) {
+  const url = `https://api.dsco.io/api/v3/order/${poNumber}/acknowledge`; 
+  
+  const options = {
+    'method': 'put', 
+    'headers': {
+      'authorization': 'Bearer ' + DSCO_API_TOKEN.trim(),
+      'accept': 'application/json'
+    },
+    'muteHttpExceptions': true
+  };
+  
+  const response = UrlFetchApp.fetch(url, options);
+  
+  if (response.getResponseCode() !== 200 && response.getResponseCode() !== 204) {
+    Logger.log(`Warning: Failed to acknowledge order ${poNumber} in DSCO. Response: ` + response.getContentText());
+  }
+}
+
+function testForceSyncOneOrder() {
+  const now = new Date();
+  const thirtyDaysAgo = new Date(now.getTime() - (30 * 24 * 60 * 60 * 1000)); 
+  const until = encodeURIComponent(now.toISOString());
+  const createdSince = encodeURIComponent(thirtyDaysAgo.toISOString());
+
+  const url = `https://api.dsco.io/api/v3/order/page?ordersCreatedSince=${createdSince}&until=${until}`; 
+  const options = {
+    'method': 'get',
+    'headers': {
+      'authorization': 'Bearer ' + DSCO_API_TOKEN.trim(), 
+      'accept': 'application/json'
+    },
+    'muteHttpExceptions': true
+  };
+  
+  const response = UrlFetchApp.fetch(url, options);
+  const dscoData = JSON.parse(response.getContentText());
+  
+  if (!dscoData.orders || dscoData.orders.length === 0) {
+    Logger.log('No historical orders found to test with.');
+    return;
+  }
+
+  const testOrder = dscoData.orders[0];
+  testOrder.poNumber = "TEST-" + testOrder.poNumber;
+  Logger.log('Attempting to push Test Order: ' + testOrder.poNumber);
+
+  const ssPayload = mapOrderToShipStation(testOrder);
+  
+  try {
+    const ssResponse = pushToShipStation(ssPayload);
+    Logger.log('SUCCESS! Order pushed to ShipStation. Internal SS Order ID: ' + ssResponse.orderId);
+  } catch (error) {
+    Logger.log('Failed to push to ShipStation: ' + error.message);
+  }
+}
+
+// ==============================================================================
+// PART 2: POLL FULFILLMENTS FROM SHIPSTATION -> PUSH TO DSCO
+// ==============================================================================
+
+function pollRecentFulfillments() {
+  const encodedAuth = Utilities.base64Encode(SS_API_KEY + ':' + SS_API_SECRET);
+  
+  let lastPollTime = scriptProperties.getProperty('LAST_POLL_TIME');
+  if (!lastPollTime) {
+    const twoHoursAgo = new Date(Date.now() - (2 * 60 * 60 * 1000)); 
+    lastPollTime = Utilities.formatDate(twoHoursAgo, "GMT", "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+  }
+
+  const currentRunTime = Utilities.formatDate(new Date(), "GMT", "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+  const url = `https://ssapi.shipstation.com/fulfillments?storeId=829584&createDateStart=${encodeURIComponent(lastPollTime)}`;
+  
+  const options = {
+    'method': 'get',
+    'headers': {
+      'Authorization': 'Basic ' + encodedAuth,
+      'Accept': 'application/json'
+    },
+    'muteHttpExceptions': true
+  };
+  
+  Logger.log(`Fetching fulfillments created since: ${lastPollTime}`);
+  const response = UrlFetchApp.fetch(url, options);
+  
+  if (response.getResponseCode() !== 200) {
+    Logger.log("Error fetching fulfillments: " + response.getContentText());
+    return;
+  }
+  
+  const data = JSON.parse(response.getContentText());
+  const fulfillments = data.fulfillments || [];
+  
+  if (fulfillments.length === 0) {
+    Logger.log("No new fulfillments found.");
+    scriptProperties.setProperty('LAST_POLL_TIME', currentRunTime);
+    return;
+  }
+  
+  Logger.log(`SUCCESS! Found ${fulfillments.length} new fulfillments to push to DSCO.`);
+  
+  fulfillments.forEach(fulfillment => {
+    const orderNum = fulfillment.orderNumber;
+    const tracking = fulfillment.trackingNumber;
+    const carrier = fulfillment.carrierCode;
+    const shipDate = fulfillment.shipDate;
+    const orderId = fulfillment.orderId; // 🚨 WE NEED THIS TO GRAB THE SKUs!
+    
+    Logger.log(`Pushing to DSCO -> Order: ${orderNum} | Tracking: ${tracking} | Carrier: ${carrier}`);
+    
+    // Pass the orderId into our tracking function
+    sendTrackingToDsco(orderNum, tracking, carrier, shipDate, orderId);
+  });
+
+  scriptProperties.setProperty('LAST_POLL_TIME', currentRunTime);
+}
+
+
+function sendTrackingToDsco(orderNum, tracking, carrier, shipDate, orderId) {
+  const realOrderNum = orderNum.replace("TEST-", "");
+  
+  // 1. FETCH THE SKUs FROM SHIPSTATION
+  const ssEncodedAuth = Utilities.base64Encode(SS_API_KEY + ':' + SS_API_SECRET);
+  const ssUrl = 'https://ssapi.shipstation.com/orders/' + orderId;
+  const ssOptions = {
+    'method': 'get',
+    'headers': {
+      'Authorization': 'Basic ' + ssEncodedAuth,
+      'Accept': 'application/json'
+    },
+    'muteHttpExceptions': true
+  };
+  
+  let dscoLineItems = [];
+  let shipMethod = "Ground"; 
+  
+  const ssResponse = UrlFetchApp.fetch(ssUrl, ssOptions);
+  
+  if (ssResponse.getResponseCode() === 200) {
+    const orderData = JSON.parse(ssResponse.getContentText());
+    if (orderData.requestedShippingService) {
+      shipMethod = orderData.requestedShippingService;
+    }
+
+    const ssItems = orderData.items || [];
+    
+    // 🚨 FIXED: Forcing lineNumber to be an Integer, not a String
+    dscoLineItems = ssItems.map((item, index) => ({
+       "lineNumber": index + 1, 
+       "sku": item.sku,
+       "quantity": item.quantity
+    }));
+  } else {
+    Logger.log(`⚠️ Failed to fetch line items from ShipStation. Response: ${ssResponse.getContentText()}`);
+    return;
+  }
+
+  // 2. PUSH EVERYTHING TO DSCO
+  const dynamicToken = getDscoToken();
+  const url = `https://api.dsco.io/api/v3/order/singleShipment`;
+  
+  const payload = {
+    "poNumber": realOrderNum,
+    "shipments": [
+      {
+        "trackingNumber": tracking,
+        "shipCarrier": carrier, 
+        "shipMethod": shipMethod, 
+        "shippingServiceLevelCode": "UG", 
+        "warehouseCode": "REPLACE_ME", // 🚨 YOU MUST UPDATE THIS
+        "shipDate": shipDate || new Date().toISOString(),
+        "lineItems": dscoLineItems 
+      }
+    ]
+  };
+
+  // 🚨 Print the exact payload so we can verify ShipStation actually found the items!
+  Logger.log("📦 Sending Payload to Chewy: " + JSON.stringify(payload));
+
+  const options = {
+    'method': 'post', 
+    'contentType': 'application/json',
+    'headers': {
+      'authorization': 'Bearer ' + dynamicToken,
+      'accept': 'application/json'
+    },
+    'payload': JSON.stringify(payload),
+    'muteHttpExceptions': true
+  };
+  
+  const response = UrlFetchApp.fetch(url, options);
+  const responseCode = response.getResponseCode();
+  const responseBody = response.getContentText();
+  
+  if (responseCode === 200 || responseCode === 201) {
+     Logger.log(`✅ Successfully updated tracking for ${realOrderNum} in DSCO. Response: ${responseBody}`);
+  } else {
+     Logger.log(`⚠️ DSCO Push Failed for ${realOrderNum} | Code: ${responseCode} | Response: ${responseBody}`);
+  }
+}
+
+
+
+// ==============================================================================
+// OAUTH2 TOKEN MANAGER
+// ==============================================================================
+
+function getDscoToken() {
+  const cache = CacheService.getScriptCache();
+  const cachedToken = cache.get('DSCO_OAUTH_TOKEN');
+  
+  // If we already generated a token recently, use it instantly!
+  if (cachedToken) {
+    return cachedToken;
+  }
+
+  const scriptProps = PropertiesService.getScriptProperties();
+  const clientId = scriptProps.getProperty('DSCO_CLIENT_ID');
+  const clientSecret = scriptProps.getProperty('DSCO_CLIENT_SECRET');
+
+  const url = 'https://api.dsco.io/api/v3/oauth2/token'; // The winning URL!
+
+  const options = {
+    'method': 'post',
+    'payload': {
+      'grant_type': 'client_credentials',
+      'client_id': clientId,
+      'client_secret': clientSecret
+    },
+    'muteHttpExceptions': true
+  };
+  
+  const response = UrlFetchApp.fetch(url, options);
+  
+  if (response.getResponseCode() !== 200) {
+    throw new Error('Failed to generate OAuth2 Token: ' + response.getContentText());
+  }
+
+  const data = JSON.parse(response.getContentText());
+  const token = data.access_token;
+  
+  // Save it in Google's cache for 55 minutes (3300 seconds)
+  cache.put('DSCO_OAUTH_TOKEN', token, 3300); 
+  
+  return token;
+}
+
+// ==============================================================================
+// DIAGNOSTIC TOOLS
+// ==============================================================================
+
+function testIsMyTokenDead() {
+  const url = `https://api.dsco.io/api/v3/order/page?status=created`; 
+  
+  const options = {
+    'method': 'get',
+    'headers': {
+      'authorization': 'Bearer ' + DSCO_API_TOKEN.trim(), 
+      'accept': 'application/json'
+    },
+    'muteHttpExceptions': true
+  };
+  
+  Logger.log("Testing DSCO Token...");
+  const response = UrlFetchApp.fetch(url, options);
+  Logger.log("Code: " + response.getResponseCode());
+  Logger.log("Response: " + response.getContentText());
+}
+
+
+
+
+
+
+
+function findTheHiddenEndpoint() {
+  const scriptProps = PropertiesService.getScriptProperties();
+  const DSCO_TOKEN = scriptProps.getProperty('DSCO_API_TOKEN');
+  
+  // Your exact test order details
+  const realOrderNum = "Y57HEUSGZC5S8DZK2KT3";
+  const tracking = "1Z9999999999999999";
+  const carrier = "UPS";
+  const shipDate = new Date().toISOString();
+
+  // The 3 ways DSCO might expect the payload
+  const shipmentObj = {
+    "trackingNumber": tracking,
+    "shippingCarrier": carrier,
+    "shipDate": shipDate
+  };
+
+  const payloadOrderUpdate = { "shipments": [ shipmentObj ] };
+  const payloadBatch = [ { "poNumber": realOrderNum, "shipments": [ shipmentObj ] } ];
+  const payloadSingle = { "poNumber": realOrderNum, "shipments": [ shipmentObj ] };
+
+  // The 10 most likely URLs based on their API architecture
+  const tests = [
+    { name: "1. PUT Update Order", url: `https://api.dsco.io/api/v3/order/${realOrderNum}`, method: 'put', payload: payloadOrderUpdate },
+    { name: "2. POST Shipments Plural Batch", url: `https://api.dsco.io/api/v3/shipments/small-batch`, method: 'post', payload: payloadBatch },
+    { name: "3. POST Order Small Batch (Upsert)", url: `https://api.dsco.io/api/v3/order/small-batch`, method: 'post', payload: payloadBatch },
+    { name: "4. PUT Order Small Batch (Update)", url: `https://api.dsco.io/api/v3/order/small-batch`, method: 'put', payload: payloadBatch },
+    { name: "5. POST Order Shipments Sub-Resource", url: `https://api.dsco.io/api/v3/order/${realOrderNum}/shipments`, method: 'post', payload: payloadOrderUpdate },
+    { name: "6. PUT Order Shipments Sub-Resource", url: `https://api.dsco.io/api/v3/order/${realOrderNum}/shipments`, method: 'put', payload: payloadOrderUpdate },
+    { name: "7. POST Order Ship Action Verbs", url: `https://api.dsco.io/api/v3/order/${realOrderNum}/ship`, method: 'post', payload: payloadOrderUpdate },
+    { name: "8. PUT Order Ship Action Verbs", url: `https://api.dsco.io/api/v3/order/${realOrderNum}/ship`, method: 'put', payload: payloadOrderUpdate },
+    { name: "9. PUT Single Shipment", url: `https://api.dsco.io/api/v3/shipment`, method: 'put', payload: payloadSingle },
+    { name: "10. POST Tracking Small Batch", url: `https://api.dsco.io/api/v3/tracking/small-batch`, method: 'post', payload: payloadBatch }
+  ];
+
+  Logger.log("🚨 Initiating Sonar Ping on DSCO Servers...");
+
+  tests.forEach(test => {
+    try {
+      const options = {
+        'method': test.method,
+        'contentType': 'application/json',
+        'headers': {
+          'authorization': 'Bearer ' + DSCO_TOKEN.trim(),
+          'accept': 'application/json'
+        },
+        'payload': JSON.stringify(test.payload),
+        'muteHttpExceptions': true
+      };
+      
+      const response = UrlFetchApp.fetch(test.url, options);
+      const code = response.getResponseCode();
+      const body = response.getContentText();
+      
+      // If it returns 403, the URL is dead. If it returns 200, 201, or 400... WE FOUND IT!
+      if (code === 403) {
+         Logger.log(`❌ ${test.name} -> DEAD END (403 AWS Error)`);
+      } else {
+         Logger.log(`✅ ${test.name} -> FOUND IT! Code: ${code} | Response: ${body}`);
+      }
+      
+      // Sleep for half a second so we don't trigger any rate limits
+      Utilities.sleep(500);
+      
+    } catch (e) {
+      Logger.log(`⚠️ ${test.name} -> Script Error: ${e.message}`);
+    }
+  });
+}
+
+
+
+function nakedPayloadTest() {
+  const scriptProps = PropertiesService.getScriptProperties();
+  const DSCO_TOKEN = scriptProps.getProperty('DSCO_API_TOKEN');
+  
+  const urls = [
+    { name: "1. Root Shipment", url: "https://api.dsco.io/api/v3/shipment" },
+    { name: "2. Small Batch Shipment", url: "https://api.dsco.io/api/v3/shipment/small-batch" }
+  ];
+  
+  Logger.log("🚨 Testing Endpoints with NO Payload...");
+
+  urls.forEach(test => {
+    try {
+      const options = {
+        'method': 'post',
+        'headers': {
+          'authorization': 'Bearer ' + DSCO_TOKEN.trim(),
+          'accept': 'application/json'
+        },
+        // NOTICE: We completely removed the 'payload' and 'contentType'
+        'muteHttpExceptions': true
+      };
+      
+      const response = UrlFetchApp.fetch(test.url, options);
+      const code = response.getResponseCode();
+      const body = response.getContentText();
+      
+      if (code === 403) {
+         Logger.log(`❌ ${test.name} -> AWS Firewall Blocked (403)`);
+      } else {
+         Logger.log(`✅ ${test.name} -> WE BROKE THROUGH! Code: ${code} | Response: ${body}`);
+      }
+      
+    } catch (e) {
+      Logger.log(`⚠️ Script Error on ${test.name}: ${e.message}`);
+    }
+  });
+}
+
+
+function getDscoOAuthToken() {
+  const scriptProps = PropertiesService.getScriptProperties();
+  const clientId = scriptProps.getProperty('DSCO_CLIENT_ID');
+  const clientSecret = scriptProps.getProperty('DSCO_CLIENT_SECRET');
+
+  const url = 'https://api.dsco.io/api/v3/oauth/token'; // Fallback to standard
+  
+  const payload = {
+    'grant_type': 'client_credentials'
+  };
+
+  const options = {
+    'method': 'post',
+    'headers': {
+      'Authorization': 'Basic ' + Utilities.base64Encode(clientId + ':' + clientSecret),
+      'Accept': 'application/json'
+    },
+    'payload': payload, // Form url-encoded
+    'muteHttpExceptions': true
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  
+  // If the URL is slightly different, let's catch it
+  if (response.getResponseCode() !== 200) {
+    Logger.log("OAuth Fetch Failed. Trying alternative URL...");
+    // Some systems use /auth/token or just at the root
+    const altUrl = 'https://api.dsco.io/oauth/token';
+    const altResponse = UrlFetchApp.fetch(altUrl, options);
+    if (altResponse.getResponseCode() === 200) {
+      return JSON.parse(altResponse.getContentText()).access_token;
+    }
+    throw new Error("Could not fetch OAuth token: " + altResponse.getContentText());
+  }
+
+  const data = JSON.parse(response.getContentText());
+  return data.access_token;
+}
+
+
+function findTheTokenEndpoint() {
+  const scriptProps = PropertiesService.getScriptProperties();
+  const clientId = scriptProps.getProperty('DSCO_CLIENT_ID');
+  const clientSecret = scriptProps.getProperty('DSCO_CLIENT_SECRET');
+
+  // The 9 most common OAuth URL patterns for CommerceHub/DSCO
+  const urlsToTest = [
+    'https://api.dsco.io/api/v3/oauth/token',
+    'https://api.dsco.io/api/v3/oauth2/token',
+    'https://api.dsco.io/api/v3/token',
+    'https://api.dsco.io/api/v3/auth/token',
+    'https://api.dsco.io/oauth/token',
+    'https://api.dsco.io/oauth2/token',
+    'https://api.dsco.io/api/v3/access_token',
+    'https://auth.dsco.io/oauth/token',
+    'https://api.rithum.com/oauth/token' 
+  ];
+
+  Logger.log("🚨 Initiating Sonar Ping for Token Endpoint...");
+
+  urlsToTest.forEach(url => {
+    try {
+      const options = {
+        'method': 'post',
+        'payload': {
+          'grant_type': 'client_credentials',
+          'client_id': clientId,
+          'client_secret': clientSecret
+        },
+        'muteHttpExceptions': true
+      };
+      
+      const response = UrlFetchApp.fetch(url, options);
+      const code = response.getResponseCode();
+      const body = response.getContentText();
+      
+      // If the body contains HTML or CloudFront, it's a dead end
+      if (code === 403 && body.includes('<HTML>')) {
+         Logger.log(`❌ ${url} -> DEAD END (CloudFront Blocked)`);
+      } else if (code === 200) {
+         Logger.log(`✅ ${url} -> FOUND IT! Token Generated!`);
+      } else {
+         // If it returns a 400 or 401 with JSON, we found the door but need to format the keys differently
+         Logger.log(`⚠️ ${url} -> Reached Server | Code: ${code} | Response: ${body}`);
+      }
+      
+      Utilities.sleep(300); // Prevent rate limiting
+      
+    } catch (e) {
+      Logger.log(`⚠️ Script Error on ${url}: ${e.message}`);
+    }
+  });
+}
+
+
+
+
+
+function findTheShipmentDoorWithOAuth2() {
+  // We use your proven OAuth2 token generator!
+  const validToken = getDscoToken(); 
+  
+  const realOrderNum = "Y57HEUSGZC5S8DZK2KT3";
+  const singleShipmentObj = {
+    "trackingNumber": "1Z9999999999999999",
+    "shippingCarrier": "UPS",
+    "shipDate": new Date().toISOString()
+  };
+
+  const tests = [
+    { name: "1. Root Shipment", url: `https://api.dsco.io/api/v3/shipment`, method: 'post', payload: { poNumber: realOrderNum, shipments: [singleShipmentObj] } },
+    { name: "2. Plural Shipments", url: `https://api.dsco.io/api/v3/shipments`, method: 'post', payload: [ { poNumber: realOrderNum, shipments: [singleShipmentObj] } ] },
+    { name: "3. Order Update (PUT)", url: `https://api.dsco.io/api/v3/order/${realOrderNum}`, method: 'put', payload: { poNumber: realOrderNum, shipments: [singleShipmentObj] } },
+    { name: "4. Order Sub-Resource (POST)", url: `https://api.dsco.io/api/v3/order/${realOrderNum}/shipment`, method: 'post', payload: { shipments: [singleShipmentObj] } },
+    { name: "5. Order Sub-Resource (PUT)", url: `https://api.dsco.io/api/v3/order/${realOrderNum}/shipment`, method: 'put', payload: { shipments: [singleShipmentObj] } },
+    { name: "6. Order Sub-Resource Plural", url: `https://api.dsco.io/api/v3/order/${realOrderNum}/shipments`, method: 'post', payload: { shipments: [singleShipmentObj] } }
+  ];
+
+  Logger.log("🚨 Initiating OAuth2 Sonar Ping on Shipment Endpoints...");
+
+  tests.forEach(test => {
+    try {
+      const options = {
+        'method': test.method,
+        'contentType': 'application/json',
+        'headers': {
+          'authorization': 'Bearer ' + validToken,
+          'accept': 'application/json'
+        },
+        'payload': JSON.stringify(test.payload),
+        'muteHttpExceptions': true
+      };
+      
+      const response = UrlFetchApp.fetch(test.url, options);
+      const code = response.getResponseCode();
+      const body = response.getContentText();
+      
+      // A 403 means the URL doesn't exist. Anything else (200, 201, 400, 422) means WE FOUND THE DOOR!
+      if (code === 403) {
+         Logger.log(`❌ ${test.name} -> URL DOES NOT EXIST (403 AWS Block)`);
+      } else {
+         Logger.log(`✅ ${test.name} -> FOUND THE DOOR! Code: ${code} | Response: ${body}`);
+      }
+      
+      Utilities.sleep(500); 
+      
+    } catch (e) {
+      Logger.log(`⚠️ Script Error on ${test.name}: ${e.message}`);
+    }
+  });
+}
+
+
+function findTheShipmentDoorWithDscoOauth() {
+  // Grab our perfectly generated OAuth2 token from the cache
+  const validToken = getDscoToken(); 
+  
+  const realOrderNum = "Y57HEUSGZC5S8DZK2KT3";
+  const singleShipmentObj = {
+    "trackingNumber": "1Z9999999999999999",
+    "shippingCarrier": "UPS",
+    "shipDate": new Date().toISOString()
+  };
+
+  const payloadBatch = [ { "poNumber": realOrderNum, "shipments": [singleShipmentObj] } ];
+
+  const tests = [
+    { name: "1. Shipment Small Batch", url: `https://api.dsco.io/api/v3/shipment/small-batch` },
+    { name: "2. Shipments Small Batch (Plural)", url: `https://api.dsco.io/api/v3/shipments/small-batch` },
+    { name: "3. Order Small Batch", url: `https://api.dsco.io/api/v3/order/small-batch` }
+  ];
+
+  Logger.log("🚨 Initiating Sonar Ping using proprietary 'DscoOauth' Header...");
+
+  tests.forEach(test => {
+    try {
+      const options = {
+        'method': 'post',
+        'contentType': 'application/json',
+        'headers': {
+          // 🚨 THE ULTIMATE FIX: Using DscoOauth instead of Bearer
+          'authorization': 'DscoOauth ' + validToken,
+          'accept': 'application/json'
+        },
+        'payload': JSON.stringify(payloadBatch),
+        'muteHttpExceptions': true
+      };
+      
+      const response = UrlFetchApp.fetch(test.url, options);
+      const code = response.getResponseCode();
+      const body = response.getContentText();
+      
+      if (code === 403) {
+         Logger.log(`❌ ${test.name} -> Route Does Not Exist (403 AWS Block)`);
+      } else {
+         Logger.log(`✅ ${test.name} -> WE FOUND THE DOOR! Code: ${code} | Response: ${body}`);
+      }
+      
+      Utilities.sleep(500); 
+      
+    } catch (e) {
+      Logger.log(`⚠️ Script Error on ${test.name}: ${e.message}`);
+    }
+  });
+}
+
+
+function ultimateAPIBruteforce() {
+  const token = getDscoToken(); // Grab our proven OAuth2 token
+  const po = "Y57HEUSGZC5S8DZK2KT3";
+  
+  const shipData = {
+    "trackingNumber": "1Z9999999999999999",
+    "shippingCarrier": "UPS",
+    "shipDate": new Date().toISOString()
+  };
+
+  const payloadBatch = [ { "poNumber": po, "shipments": [shipData] } ];
+  const payloadSingle = { "poNumber": po, "shipments": [shipData] };
+  const payloadSub = { "shipments": [shipData] };
+
+  const urls = [
+    { path: `https://api.dsco.io/api/v3/shipment/small-batch`, method: 'post', payload: payloadBatch },
+    { path: `https://api.dsco.io/api/v3/shipments/small-batch`, method: 'post', payload: payloadBatch },
+    { path: `https://api.dsco.io/api/v3/order/small-batch`, method: 'post', payload: payloadBatch },
+    { path: `https://api.dsco.io/api/v3/order/shipment/small-batch`, method: 'post', payload: payloadBatch },
+    { path: `https://api.dsco.io/api/v3/shipment`, method: 'post', payload: payloadSingle },
+    { path: `https://api.dsco.io/api/v3/shipment`, method: 'put', payload: payloadSingle },
+    { path: `https://api.dsco.io/api/v3/order/${po}/shipment`, method: 'post', payload: payloadSub },
+    { path: `https://api.dsco.io/api/v3/order/${po}/shipment`, method: 'put', payload: payloadSub }
+  ];
+
+  Logger.log("🚨 Initiating Ultimate API Bruteforce...");
+
+  urls.forEach((test) => {
+    // 1. Test with standard Bearer header
+    try {
+      const optBearer = {
+        'method': test.method,
+        'contentType': 'application/json',
+        'headers': { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' },
+        'payload': JSON.stringify(test.payload),
+        'muteHttpExceptions': true
+      };
+      const res1 = UrlFetchApp.fetch(test.path, optBearer);
+      if (res1.getResponseCode() !== 403) {
+        Logger.log(`✅ WINNER (Bearer)! ${test.path} (${test.method}) -> Code: ${res1.getResponseCode()} | Response: ${res1.getContentText()}`);
+        return; // We found it, stop testing this URL!
+      }
+    } catch(e) {}
+    
+    Utilities.sleep(300);
+
+    // 2. Test with Chewy's DscoOauth header
+    try {
+      const optDsco = {
+        'method': test.method,
+        'contentType': 'application/json',
+        'headers': { 'Authorization': 'DscoOauth ' + token, 'Accept': 'application/json' },
+        'payload': JSON.stringify(test.payload),
+        'muteHttpExceptions': true
+      };
+      const res2 = UrlFetchApp.fetch(test.path, optDsco);
+      if (res2.getResponseCode() !== 403) {
+        Logger.log(`✅ WINNER (DscoOauth)! ${test.path} (${test.method}) -> Code: ${res2.getResponseCode()} | Response: ${res2.getContentText()}`);
+        return; // We found it, stop testing this URL!
+      }
+    } catch(e) {}
+    
+    Utilities.sleep(300);
+    Logger.log(`❌ ${test.path} (${test.method}) -> Dead End`);
+  });
+}
+
+
+
+
