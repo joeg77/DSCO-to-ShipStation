@@ -168,6 +168,7 @@ function acknowledgeDscoOrder(poNumber) {
 // PART 2: POLL FULFILLMENTS FROM SHIPSTATION -> PUSH TO DSCO
 // ==============================================================================
 
+
 function pollRecentFulfillments() {
   const encodedAuth = Utilities.base64Encode(SS_API_KEY + ':' + SS_API_SECRET);
   
@@ -178,7 +179,9 @@ function pollRecentFulfillments() {
   }
 
   const currentRunTime = Utilities.formatDate(new Date(), "GMT", "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
-  const url = `https://ssapi.shipstation.com/fulfillments?storeId=829584&createDateStart=${encodeURIComponent(lastPollTime)}`;
+  
+  // 🚨 THE FIX: We are now asking for 'shipments' instead of 'fulfillments'!
+  const url = `https://ssapi.shipstation.com/shipments?storeId=829584&createDateStart=${encodeURIComponent(lastPollTime)}`;
   
   const options = {
     'method': 'get',
@@ -189,31 +192,32 @@ function pollRecentFulfillments() {
     'muteHttpExceptions': true
   };
   
-  Logger.log(`Fetching fulfillments created since: ${lastPollTime}`);
+  Logger.log(`Fetching physical shipments created since: ${lastPollTime}`);
   const response = UrlFetchApp.fetch(url, options);
   
   if (response.getResponseCode() !== 200) {
-    Logger.log("Error fetching fulfillments: " + response.getContentText());
+    Logger.log("Error fetching shipments: " + response.getContentText());
     return;
   }
   
   const data = JSON.parse(response.getContentText());
-  const fulfillments = data.fulfillments || [];
+  // 🚨 Grab the shipments array from the response
+  const shipments = data.shipments || [];
   
-  if (fulfillments.length === 0) {
-    Logger.log("No new fulfillments found.");
+  if (shipments.length === 0) {
+    Logger.log("No new shipments found.");
     scriptProperties.setProperty('LAST_POLL_TIME', currentRunTime);
     return;
   }
   
-  Logger.log(`SUCCESS! Found ${fulfillments.length} new fulfillments to push to DSCO.`);
+  Logger.log(`SUCCESS! Found ${shipments.length} new shipments to push to DSCO.`);
   
-  fulfillments.forEach(fulfillment => {
-    const orderNum = fulfillment.orderNumber;
-    const tracking = fulfillment.trackingNumber;
-    const carrier = fulfillment.carrierCode;
-    const shipDate = fulfillment.shipDate;
-    const orderId = fulfillment.orderId; 
+  shipments.forEach(shipment => {
+    const orderNum = shipment.orderNumber;
+    const tracking = shipment.trackingNumber;
+    const carrier = shipment.carrierCode;
+    const shipDate = shipment.shipDate;
+    const orderId = shipment.orderId; 
     
     Logger.log(`Pushing to DSCO -> Order: ${orderNum} | Tracking: ${tracking} | Carrier: ${carrier}`);
     
@@ -222,6 +226,7 @@ function pollRecentFulfillments() {
 
   scriptProperties.setProperty('LAST_POLL_TIME', currentRunTime);
 }
+
 
 
 function sendTrackingToDsco(orderNum, tracking, carrier, shipDate, orderId) {
@@ -351,3 +356,102 @@ function getDscoToken() {
   
   return token;
 }
+
+
+
+
+function rewindTheClock() {
+  const threeDaysAgo = new Date(Date.now() - (3 * 24 * 60 * 60 * 1000));
+  PropertiesService.getScriptProperties().setProperty('LAST_ORDER_POLL_TIME', threeDaysAgo.toISOString());
+  Logger.log("🕰️ Clock rewound! The script will now look for orders created since: " + threeDaysAgo.toISOString());
+}
+
+
+function verifyChewyOrderStatus() {
+  // 🚨 Put the real Chewy Order Number here (the one you just shipped)
+  const poNumber = "REPLACE_WITH_REAL_ORDER_NUMBER"; 
+  
+  const url = `https://api.dsco.io/api/v3/order/${poNumber}`;
+  
+  const options = {
+    'method': 'get',
+    'headers': {
+      'authorization': 'Bearer ' + getDscoToken(),
+      'accept': 'application/json'
+    },
+    'muteHttpExceptions': true
+  };
+  
+  const response = UrlFetchApp.fetch(url, options);
+  
+  if (response.getResponseCode() !== 200) {
+    Logger.log("Failed to fetch order: " + response.getContentText());
+    return;
+  }
+  
+  const data = JSON.parse(response.getContentText());
+  
+  Logger.log(`📦 Status in Chewy: ${data.status}`);
+  
+  if (data.shipments && data.shipments.length > 0) {
+    Logger.log(`✅ Tracking Number found: ${data.shipments[0].trackingNumber}`);
+    Logger.log(`🚚 Carrier: ${data.shipments[0].shipCarrier}`);
+  } else {
+    Logger.log("⚠️ No tracking information found on this order in Chewy yet.");
+  }
+}
+
+
+
+
+function rewindTheFulfillmentClock() {
+  const threeDaysAgo = new Date(Date.now() - (3 * 24 * 60 * 60 * 1000));
+  const formattedTime = Utilities.formatDate(threeDaysAgo, "GMT", "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+  PropertiesService.getScriptProperties().setProperty('LAST_POLL_TIME', formattedTime);
+  Logger.log("🕰️ Fulfillment clock rewound! Looking for labels created since: " + formattedTime);
+}
+
+
+function findMyMissingOrder() {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const SS_API_KEY = scriptProperties.getProperty('SS_API_KEY');
+  const SS_API_SECRET = scriptProperties.getProperty('SS_API_SECRET');
+  const encodedAuth = Utilities.base64Encode(SS_API_KEY + ':' + SS_API_SECRET);
+  
+  // 1. Search ShipStation for this exact order
+  const url = 'https://ssapi.shipstation.com/orders?orderNumber=AW76YTQL54US1H8DMAFP';
+  
+  const options = {
+    'method': 'get',
+    'headers': {
+      'Authorization': 'Basic ' + encodedAuth,
+      'Accept': 'application/json'
+    },
+    'muteHttpExceptions': true
+  };
+  
+  const response = UrlFetchApp.fetch(url, options);
+  const data = JSON.parse(response.getContentText());
+  
+  if (data.orders && data.orders.length > 0) {
+    const order = data.orders[0];
+    Logger.log("📦 Order Found in ShipStation!");
+    Logger.log("Store ID: " + order.advancedOptions.storeId);
+    Logger.log("Order Status: " + order.orderStatus);
+    
+    // 2. Check if a fulfillment (label) exists for it yet
+    const fUrl = 'https://ssapi.shipstation.com/fulfillments?orderId=' + order.orderId;
+    const fResponse = UrlFetchApp.fetch(fUrl, options);
+    const fData = JSON.parse(fResponse.getContentText());
+    
+    if (fData.fulfillments && fData.fulfillments.length > 0) {
+       Logger.log("✅ Fulfillment Found! Tracking: " + fData.fulfillments[0].trackingNumber);
+       Logger.log("Fulfillment Create Date: " + fData.fulfillments[0].createDate);
+    } else {
+       Logger.log("⚠️ Order is there, but ShipStation's API doesn't show a label for it yet.");
+    }
+  } else {
+    Logger.log("❌ Order not found in ShipStation at all.");
+  }
+}
+
