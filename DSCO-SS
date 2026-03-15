@@ -228,91 +228,90 @@ function pollRecentFulfillments() {
 }
 
 
-
-function sendTrackingToDsco(orderNum, tracking, carrier, shipDate, orderId) {
+function sendTrackingToDsco(orderNum, tracking, carrier, shipDate, itemsInThisBox) {
   const realOrderNum = orderNum.replace("TEST-", "");
   
-  // 1. FETCH THE SKUs FROM SHIPSTATION
-  const ssEncodedAuth = Utilities.base64Encode(SS_API_KEY + ':' + SS_API_SECRET);
-  const ssUrl = 'https://ssapi.shipstation.com/orders/' + orderId;
-  const ssOptions = {
-    'method': 'get',
-    'headers': {
-      'Authorization': 'Basic ' + ssEncodedAuth,
-      'Accept': 'application/json'
-    },
-    'muteHttpExceptions': true
-  };
-  
+  // 1. The Safety Net: Did ShipStation actually give us items for this box?
+  const safeItems = itemsInThisBox || [];
   let dscoLineItems = [];
-  // Set the default safety net to FedEx Home Delivery
-  let shipMethod = "FedEx Home Delivery"; 
-  
-  const ssResponse = UrlFetchApp.fetch(ssUrl, ssOptions);
-  
-  if (ssResponse.getResponseCode() === 200) {
-    const orderData = JSON.parse(ssResponse.getContentText());
-    if (orderData.requestedShippingService) {
-      shipMethod = orderData.requestedShippingService;
-    }
 
-    const ssItems = orderData.items || [];
-    
-    // Map the line items exactly as Chewy needs them
-    dscoLineItems = ssItems.map((item, index) => ({
-       "lineNumber": index + 1, 
-       "sku": item.sku,
-       "quantity": item.quantity
+  if (safeItems.length > 0) {
+    // PLAN A: ShipStation gave us the exact box items (Perfect for Multi-Box!)
+    dscoLineItems = safeItems.map((item, index) => ({
+         "lineNumber": index + 1, 
+         "sku": item.sku,
+         "quantity": item.quantity
     }));
   } else {
-    Logger.log(`⚠️ Failed to fetch line items from ShipStation. Response: ${ssResponse.getContentText()}`);
-    return;
+    // PLAN B: ShipStation returned null. We must fetch the items from the original order!
+    Logger.log(`⚠️ ShipStation didn't provide box items. Fetching fallback items from original order...`);
+    
+    const scriptProperties = PropertiesService.getScriptProperties();
+    const SS_API_KEY = scriptProperties.getProperty('SS_API_KEY');
+    const SS_API_SECRET = scriptProperties.getProperty('SS_API_SECRET');
+    const encodedAuth = Utilities.base64Encode(SS_API_KEY + ':' + SS_API_SECRET);
+    
+    const oUrl = `https://ssapi.shipstation.com/orders?orderNumber=${orderNum}`;
+    const options = {
+      'method': 'get',
+      'headers': {
+        'Authorization': 'Basic ' + encodedAuth,
+        'Accept': 'application/json'
+      },
+      'muteHttpExceptions': true
+    };
+    
+    const response = UrlFetchApp.fetch(oUrl, options);
+    const data = JSON.parse(response.getContentText());
+    
+    if (data.orders && data.orders.length > 0 && data.orders[0].items) {
+      dscoLineItems = data.orders[0].items.map((item, index) => ({
+           "lineNumber": index + 1, 
+           "sku": item.sku,
+           "quantity": item.quantity
+      }));
+    }
   }
 
-  // 2. PUSH EVERYTHING TO DSCO
-  const dynamicToken = getDscoToken();
+  // 2. The Weekend Fix: Force the date to "Right Now"
+  const safeShipDate = new Date().toISOString();
+  
   const url = `https://api.dsco.io/api/v3/order/singleShipment`;
   
-  // 🚨 THE ABSOLUTE FINAL PAYLOAD
   const payload = {
     "poNumber": realOrderNum,
     "shipments": [
       {
         "trackingNumber": tracking,
-        "shipCarrier": "FedEx", // Hardcoded since you exclusively use FedEx
-        "shipMethod": shipMethod, 
-        "shippingServiceLevelCode": "HD", // HD = FedEx Home Delivery
-        "warehouseCode": "CROWDER", // Your exact Chewy Warehouse ID
-        "shipDate": shipDate || new Date().toISOString(),
+        "shipCarrier": "FedEx", 
+        "shipMethod": "FedEx Home Delivery", 
+        "shippingServiceLevelCode": "HD", 
+        "warehouseCode": "CROWDER", 
+        "shipDate": safeShipDate, // <--- The magic date fix
         "lineItems": dscoLineItems 
       }
     ]
   };
 
-  const options = {
-    'method': 'post', 
-    'contentType': 'application/json',
+  const dscoOptions = {
+    'method': 'post',
     'headers': {
-      'authorization': 'Bearer ' + dynamicToken,
+      'authorization': 'Bearer ' + getDscoToken(),
+      'content-type': 'application/json',
       'accept': 'application/json'
     },
     'payload': JSON.stringify(payload),
     'muteHttpExceptions': true
   };
   
-  const response = UrlFetchApp.fetch(url, options);
-  const responseCode = response.getResponseCode();
-  const responseBody = response.getContentText();
+  const dscoResponse = UrlFetchApp.fetch(url, dscoOptions);
   
-  if (responseCode === 200 || responseCode === 201) {
-     Logger.log(`✅ Successfully updated tracking for ${realOrderNum} in DSCO. Response: ${responseBody}`);
+  if (dscoResponse.getResponseCode() === 200 || dscoResponse.getResponseCode() === 201) {
+    Logger.log(`✅ Successfully updated tracking for ${realOrderNum} in DSCO. Response: ${dscoResponse.getContentText()}`);
   } else {
-     Logger.log(`⚠️ DSCO Push Failed for ${realOrderNum} | Code: ${responseCode} | Response: ${responseBody}`);
+    Logger.log(`⚠️ DSCO Push Failed for ${realOrderNum} | Code: ${dscoResponse.getResponseCode()} | Response: ${dscoResponse.getContentText()}`);
   }
 }
-
-
-
 
 // ==============================================================================
 // OAUTH2 TOKEN MANAGER
@@ -454,4 +453,46 @@ function findMyMissingOrder() {
     Logger.log("❌ Order not found in ShipStation at all.");
   }
 }
+
+
+
+
+
+function retryStuckOrder() {
+  const orderNum = "PUT_PO_NUM_HERE"; // The stuck order
+  
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const SS_API_KEY = scriptProperties.getProperty('SS_API_KEY');
+  const SS_API_SECRET = scriptProperties.getProperty('SS_API_SECRET');
+  const encodedAuth = Utilities.base64Encode(SS_API_KEY + ':' + SS_API_SECRET);
+  
+  const url = `https://ssapi.shipstation.com/shipments?orderNumber=${orderNum}`;
+  
+  const options = {
+    'method': 'get',
+    'headers': {
+      'Authorization': 'Basic ' + encodedAuth,
+      'Accept': 'application/json'
+    },
+    'muteHttpExceptions': true
+  };
+  
+  const response = UrlFetchApp.fetch(url, options);
+  const data = JSON.parse(response.getContentText());
+  const shipments = data.shipments || [];
+  
+  if (shipments.length > 0) {
+    const shipment = shipments[0]; 
+    Logger.log(`📦 Found order ${orderNum} in ShipStation! Pushing to Chewy now...`);
+    
+    // We pass the data directly to your main tracking function
+    sendTrackingToDsco(shipment.orderNumber, shipment.trackingNumber, shipment.carrierCode, shipment.shipDate, shipment.shipmentItems);
+  } else {
+    Logger.log("❌ Could not find the shipment in ShipStation.");
+  }
+}
+
+
+
+
 
