@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <style>
+      body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: center; padding: 50px; background-color: #f8f9fa; }
+      .container { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); max-width: 500px; margin: auto; }
+      h2 { color: #333; margin-bottom: 30px; }
+      button { display: block; width: 100%; padding: 15px; font-size: 16px; font-weight: bold; margin: 15px 0; cursor: pointer; border: none; border-radius: 5px; color: white; transition: 0.2s; }
+      .btn-blue { background-color: #007bff; }
+      .btn-blue:hover { background-color: #0056b3; }
+      .btn-green { background-color: #28a745; }
+      .btn-green:hover { background-color: #1e7e34; }
+      #status { margin-top: 20px; font-weight: bold; padding: 10px; border-radius: 5px; }
+      .loader { display: none; margin-top: 15px; font-style: italic; color: #666; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h2>📦 Chewy Fulfillment Center</h2>
+      
+      <button class="btn-blue" onclick="runFetch()">1. Fetch New Orders from Chewy</button>
+      <button class="btn-green" onclick="runLabels()">2. Push Tracking to Chewy</button>
+      
+      <div id="loader" class="loader">⚙️ Working... please wait...</div>
+      <div id="status"></div>
+    </div>
+
+    <script>
+      function runFetch() {
+        showLoader();
+        // This talks directly to your Code.gs file!
+        google.script.run.withSuccessHandler(showSuccess).withFailureHandler(showError).uiFetchOrders();
+      }
+
+      function runLabels() {
+        showLoader();
+        // This talks directly to your Code.gs file!
+        google.script.run.withSuccessHandler(showSuccess).withFailureHandler(showError).uiProcessLabels();
+      }
+
+      function showLoader() {
+        document.getElementById('status').innerText = "";
+        document.getElementById('status').style.backgroundColor = "transparent";
+        document.getElementById('loader').style.display = "block";
+      }
+
+      function showSuccess(message) {
+        document.getElementById('loader').style.display = "none";
+        const statusEl = document.getElementById('status');
+        statusEl.innerText = "✅ " + message;
+        statusEl.style.backgroundColor = "#d4edda";
+        statusEl.style.color = "#155724";
+      }
+
+      function showError(error) {
+        document.getElementById('loader').style.display = "none";
+        const statusEl = document.getElementById('status');
+        statusEl.innerText = "❌ Error: " + error.message;
+        statusEl.style.backgroundColor = "#f8d7da";
+        statusEl.style.color = "#721c24";
+      }
+    </script>
+  </body>
+</html>
