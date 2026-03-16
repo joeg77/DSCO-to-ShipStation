@@ -1,3 +1,34 @@
+// This function tells Google to serve your HTML page as a web app
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('Dashboard')
+      .setTitle('Chewy Fulfillment Control Center')
+      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+// Button 1 triggers this:
+function uiFetchOrders() {
+  try {
+    syncNewOrders(); // Your existing function that pulls from Chewy
+    return "Successfully grabbed new orders and sent them to ShipStation!";
+  } catch (e) {
+    throw new Error(e.toString());
+  }
+}
+
+// Button 2 triggers this:
+function uiProcessLabels() {
+  try {
+    pollRecentFulfillments(); // This runs the robot we built last week!
+    return "Successfully pushed all new tracking numbers to Chewy!";
+  } catch (e) {
+    throw new Error(e.toString());
+  }
+}
+
+
+
+
+
 // ==============================================================================
 // DSCO to ShipStation Order Sync & Tracking Push (PRODUCTION)
 // ==============================================================================
@@ -493,6 +524,66 @@ function retryStuckOrder() {
 }
 
 
+function simulateMasterTrackingOrder() {
+  // 🚨 Put your multi-package (Master Tracking) order number right here:
+  const testOrderNumber = "GK25NP877NJN41QJQF56"; 
 
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const SS_API_KEY = scriptProperties.getProperty('SS_API_KEY');
+  const SS_API_SECRET = scriptProperties.getProperty('SS_API_SECRET');
+  const encodedAuth = Utilities.base64Encode(SS_API_KEY + ':' + SS_API_SECRET);
+  
+  // Ask ShipStation for the physical shipments tied to this exact order
+  const url = `https://ssapi.shipstation.com/shipments?orderNumber=${testOrderNumber}`;
+  
+  const options = {
+    'method': 'get',
+    'headers': {
+      'Authorization': 'Basic ' + encodedAuth,
+      'Accept': 'application/json'
+    },
+    'muteHttpExceptions': true
+  };
+  
+  const response = UrlFetchApp.fetch(url, options);
+  const data = JSON.parse(response.getContentText());
+  const shipments = data.shipments || [];
+  
+  if (shipments.length === 0) {
+    Logger.log("❌ No physical shipments found for this order in ShipStation.");
+    return;
+  }
+  
+  Logger.log(`📦 SUCCESS! Found ${shipments.length} shipment record(s) for this order.`);
+  
+  // Loop through what ShipStation sees and build the Chewy payload
+  shipments.forEach((shipment, index) => {
+    Logger.log(`\n--- SHIPMENT RECORD ${index + 1} ---`);
+    Logger.log(`Master Tracking: ${shipment.trackingNumber}`);
+    
+    const itemsInThisBox = shipment.shipmentItems || [];
+    
+    const dscoLineItems = itemsInThisBox.map((item, i) => ({
+       "lineNumber": i + 1, 
+       "sku": item.sku,
+       "quantity": item.quantity
+    }));
+    
+    const payload = {
+      "poNumber": testOrderNumber.replace("TEST-", ""),
+      "shipments": [
+        {
+          "trackingNumber": shipment.trackingNumber,
+          "shipCarrier": "FedEx", 
+          "shipMethod": "FedEx Home Delivery",
+          "lineItems": dscoLineItems 
+        }
+      ]
+    };
+    
+    Logger.log("🤖 What the script WOULD send to Chewy for this record:");
+    Logger.log(JSON.stringify(payload, null, 2));
+  });
+}
 
 
